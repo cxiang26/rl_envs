@@ -5,7 +5,12 @@ import gymnasium as gym
 from scipy.spatial.transform import Rotation
 from gymnasium.spaces import Box
 from gymnasium.spaces import flatten_space, flatten
-from xrocs.utils.logger.logger_loader import logger
+# xRocs logger (only needed for Franka/UR robots)
+try:
+    from xrocs.utils.logger.logger_loader import logger
+except ImportError:
+    import logging
+    logger = logging.getLogger(__name__)
 from rl_envs.shared_state import shared_state
 import cv2
 import traceback
@@ -53,30 +58,54 @@ class HumanIntervention(gym.ActionWrapper):
             try:
                 obs = self.env.unwrapped.get_xtele()
                 xtele_joints, xtele_pose = obs['joints'], obs['pose']
-                # print("gripper_value:", len(xtele_joints), xtele_joints[-1])
-                if self.control_mode == "joint":
-                    expert_a = xtele_joints
-                else:
-                    curr_matrix = self.pose2matrix(self.env.unwrapped.currpos)
-                    tar_matrix = self.pose2matrix(xtele_pose)
-                    T_diff_matrix = np.dot(np.linalg.inv(curr_matrix), tar_matrix)
-
-                    
-                rel_rot = Rotation.from_matrix(T_diff_matrix[:3, :3]).as_euler("xyz")
-                rel_pos = T_diff_matrix[:3, 3]
-                expert_a = np.zeros(7, dtype=np.float32)
-                expert_a[:3] = rel_pos / self.env.unwrapped.action_scale[0]
-                expert_a[3:6] = rel_rot / self.env.unwrapped.action_scale[1]
-                expert_a[6:] = xtele_joints[-1] / self.env.unwrapped.action_scale[2]
                 
-                # expert_a = np.clip(expert_a, [-1]*7, [1]*7)
-                """
-                intervention action 边缘裁剪
-                """
-                epsilon = 1e-6
-                expert_a[0:6]= expert_a[0:6].clip(-1+epsilon, 1-epsilon)
+                # 对于 a2d 机器人，get_xtele() 返回的是增量向量
+                if 'a2d' in self.robot_type:
+                    # pose_delta 是 7 维向量 [delta_pos(3) + delta_rot(3) + gripper_delta(1)]
+                    pose_delta = np.array(xtele_pose)  # 或 xtele_joints，两者相同
+                    
+                    # 解析增量向量
+                    delta_pos = pose_delta[:3]  # 位置增量
+                    delta_rot = pose_delta[3:6]  # 旋转增量（欧拉角）
+                    gripper_delta = pose_delta[6]  # 夹爪增量
+                    
+                    # 直接使用增量向量，归一化后作为动作
+                    expert_a = np.zeros(7, dtype=np.float32)
+                    expert_a[:3] = delta_pos / self.env.unwrapped.action_scale[0]
+                    expert_a[3:6] = delta_rot / self.env.unwrapped.action_scale[1]
+                    expert_a[6:] = gripper_delta / self.env.unwrapped.action_scale[2]
+                    
+                    # 边缘裁剪
+                    epsilon = 1e-6
+                    expert_a[0:6] = expert_a[0:6].clip(-1+epsilon, 1-epsilon)
+                    
+                    return expert_a, pose_delta, True
+                else:
+                    # 对于其他机器人（franka/ur），使用原有逻辑
+                    # print("gripper_value:", len(xtele_joints), xtele_joints[-1])
+                    if self.control_mode == "joint":
+                        expert_a = xtele_joints
+                    else:
+                        curr_matrix = self.pose2matrix(self.env.unwrapped.currpos)
+                        tar_matrix = self.pose2matrix(xtele_pose)
+                        T_diff_matrix = np.dot(np.linalg.inv(curr_matrix), tar_matrix)
 
-                return expert_a, xtele_joints, True
+                        
+                        rel_rot = Rotation.from_matrix(T_diff_matrix[:3, :3]).as_euler("xyz")
+                        rel_pos = T_diff_matrix[:3, 3]
+                        expert_a = np.zeros(7, dtype=np.float32)
+                        expert_a[:3] = rel_pos / self.env.unwrapped.action_scale[0]
+                        expert_a[3:6] = rel_rot / self.env.unwrapped.action_scale[1]
+                        expert_a[6:] = xtele_joints[-1] / self.env.unwrapped.action_scale[2]
+                        
+                        # expert_a = np.clip(expert_a, [-1]*7, [1]*7)
+                        """
+                        intervention action 边缘裁剪
+                        """
+                        epsilon = 1e-6
+                        expert_a[0:6]= expert_a[0:6].clip(-1+epsilon, 1-epsilon)
+
+                    return expert_a, xtele_joints, True
             except Exception as e:
                 print(f"Error in action: {e}")
                 print(f"[{type(e).__name__}] {e!r}")

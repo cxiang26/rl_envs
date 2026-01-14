@@ -12,9 +12,11 @@ import time
 from typing import Dict
 
 
-from xrocs.core.config_loader import ConfigLoader
-from xrocs.core.station_loader import StationLoader
-from xrocs.common.data_type import Joints
+# xRocs imports (only needed for Franka/UR robots, not for A2D)
+# These will be imported conditionally when needed
+ConfigLoader = None
+StationLoader = None
+Joints = None
 
 
 
@@ -68,8 +70,8 @@ class BaseEnv(gym.Env):
         self.config = config
         self._gripper_sleep = config.gripper_sleep
         self.joint_dim = config.joint_dim
-        self._reset_joint = np.array(config.reset_joint)[0:self.joint_dim]
-        # self._reset_pose = np.array(config.target_pose)
+        self._reset_joint = np.array(config.reset_joint)[self.joint_dim:2*self.joint_dim]
+        self._reset_pose = np.array(config.reset_joint)[self.joint_dim:2*self.joint_dim]
         self._random_xy_range = config.random_xy_range
         self._random_rz_range = config.random_rz_range
         self._random_reset = config.random_reset
@@ -133,16 +135,84 @@ class BaseEnv(gym.Env):
             print_green("fake env : not connect to robot")
             return 
 
-        cfg_loader = ConfigLoader("/home/eai/Documents/configuration.toml")
-        self.cfg_dict = cfg_loader.get_config()
-        station_loader = StationLoader(self.cfg_dict)
-        self.robot_station = station_loader.generate_station_handle()
-        try:
-            self.robot_station.connect()
-        except Exception as e:
-            print(f"[{type(e).__name__}] {e!r}")
-            traceback.print_exc()          # full stacktrace
-            sys.exit(1)
+        if "a2d" in self.robot_type.lower():
+            try:
+                import sys
+                import os
+                a2d_sdk_paths = [
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'third_party'),
+                    '/home/xcq/projects/HIL-RL/rl_envs',
+                ]
+                for path in a2d_sdk_paths:
+                    if os.path.exists(path) and path not in sys.path:
+                        sys.path.insert(0, path)
+                
+                from a2d_sdk.robot import RobotDds, CosineCamera, RobotController
+                from robot_tools.kinematics.joint2ee import Joint2EE
+                from robot_tools.kinematics.ik import InverseKinematics
+                
+                self.robot_station = RobotDds()
+                self.robot_controller = RobotController()
+                
+                if hasattr(config, 'image_keys') and config.image_keys:
+                    a2d_camera_names = []
+                    for key in config.image_keys:
+                        camera_mapping = {
+                            'right': '/camera/hand_right_color',
+                            'wrist': '/camera/hand_right_color',
+                            'head': '/camera/head_color',
+                            'left': '/camera/hand_left_color',
+                        }
+                        a2d_name = camera_mapping.get(key, f'/camera/{key}_color')
+                        a2d_camera_names.append(a2d_name)
+                    self.camera_group = CosineCamera(a2d_camera_names)
+                else:
+                    self.camera_group = None
+                
+                self.ik = None
+                if hasattr(config, 'control_mode') and config.control_mode == "pose":
+                    urdf_path = '/home/xcq/projects/HIL-RL/rl_envs/robot_tools/assets/G1_skillhands6_skillhands6_v1.5_corrected.urdf'
+                    
+                    if urdf_path:
+                        self.ik = InverseKinematics(urdf_path)
+                        print_green(f"A2D: Joint2EE and IK initialized with {urdf_path}")
+                    else:
+                        print_green("A2D: Warning - URDF file not found, EE control disabled")
+                
+                print_green("A2D robot initialized successfully")
+                
+            except ImportError as e:
+                print(f"[{type(e).__name__}] A2D SDK import failed: {e!r}")
+                print("Please ensure a2d_sdk is installed and in PYTHONPATH")
+                traceback.print_exc()
+                sys.exit(1)
+            except Exception as e:
+                print(f"[{type(e).__name__}] A2D initialization failed: {e!r}")
+                traceback.print_exc()
+                sys.exit(1)
+        else:
+            # 原有的xRocs初始化逻辑（Franka/UR）
+            try:
+                from xrocs.core.config_loader import ConfigLoader
+                from xrocs.core.station_loader import StationLoader
+                from xrocs.common.data_type import Joints
+            except ImportError as e:
+                print(f"[{type(e).__name__}] xRocs import failed: {e!r}")
+                print("Please ensure xRocs is installed and in PYTHONPATH")
+                print("For A2D robot, xRocs is not required")
+                traceback.print_exc()
+                sys.exit(1)
+            
+            cfg_loader = ConfigLoader("/home/eai/Documents/configuration.toml")
+            self.cfg_dict = cfg_loader.get_config()
+            station_loader = StationLoader(self.cfg_dict)
+            self.robot_station = station_loader.generate_station_handle()
+            try:
+                self.robot_station.connect()
+            except Exception as e:
+                print(f"[{type(e).__name__}] {e!r}")
+                traceback.print_exc()          # full stacktrace
+                sys.exit(1)
         
         self._update_currpos()
         self.last_gripper_act = time.time()
@@ -184,10 +254,42 @@ class BaseEnv(gym.Env):
 
 
     def clip_safety_box(self, pose: np.ndarray) -> np.ndarray:
-        """Clip the pose to be within the safety box."""
+        """Clip the pose to be within the safety box.
+        
+        Args:
+            pose: 位姿数组，可以是：
+                - 6维: [x, y, z, roll, pitch, yaw]
+                - 7维: [x, y, z, roll, pitch, yaw, gripper] 或 [x, y, z, qx, qy, qz, qw]
+        
+        Returns:
+            裁剪后的位姿数组
+        """
+        original_pose = pose.copy()
+        
+        # 限制位置 (x, y, z)
         pose[:3] = np.clip(
             pose[:3], self.xyz_bounding_box.low, self.xyz_bounding_box.high
         )
+        
+        # 限制姿态 (roll, pitch, yaw) - 仅当位姿是欧拉角格式时
+        if len(pose) >= 6:
+            # 判断是否是欧拉角格式（通常欧拉角范围较大，如 [-π, π]）
+            # 如果是四元数格式，前3个分量通常在 [-1, 1] 范围内
+            is_euler_format = (
+                len(pose) == 6 or  # 6维格式通常是 xyz + rpy
+                (len(pose) >= 7 and np.any(np.abs(pose[3:6]) > 1.0))  # 7维格式，如果第4-6维超出[-1,1]，可能是rpy
+            )
+            
+            if is_euler_format:
+                # 限制欧拉角
+                pose[3:6] = np.clip(
+                    pose[3:6], self.rpy_bounding_box.low, self.rpy_bounding_box.high
+                )
+        
+        # 检查是否有越界（用于警告，仅在非fake_env模式下）
+        if not self.fake_env and not np.array_equal(original_pose[:3], pose[:3]):
+            print(f"Warning: Position clipped from {original_pose[:3]} to {pose[:3]}")
+        
         return pose
 
     def pose_quat2euler(self, pose):
@@ -218,6 +320,19 @@ class BaseEnv(gym.Env):
                 'pose': xtele_ee_pose,
             }
             return recv
+        elif 'a2d' in self.robot_type:
+            # 与 franka 保持一致：先退出同步模式，再获取动作
+            self.tele_agent.exit_any_sync()
+            # act() 返回末端位姿增量向量 [delta_pos(3) + delta_rot(3) + gripper_delta(1)] = 7维
+            pose_delta = self.tele_agent.act()
+            
+            # 直接返回增量向量，不进行位姿计算和IK转换
+            # 绝对位姿的计算应该在 HumanIntervention wrapper 中完成
+            recv = {
+                'joints': pose_delta.tolist(),
+                'pose': pose_delta.tolist(),
+            }
+            return recv
         else:
             raise NotImplementedError("Unknown robot type")
 
@@ -225,6 +340,237 @@ class BaseEnv(gym.Env):
         if 'ur' in self.robot_type or 'franka' in self.robot_type:
             from xtele.core.integrate_module import TeleCore
             self.tele_agent = TeleCore()
+        elif 'a2d' in self.robot_type:
+            # pyspacemouse 使用函数式 API，创建包装类以适配现有代码
+            import pyspacemouse
+            
+            class SpaceMouse:
+                """SpaceMouse 包装类，适配 pyspacemouse 函数式 API"""
+                
+                def __init__(self, base_env_ref=None):
+                    """
+                    初始化 SpaceMouse 包装类
+                    
+                    Args:
+                        base_env_ref: BaseEnv 的弱引用，用于 act() 方法访问机器人状态
+                    """
+                    import weakref
+                    self.pyspacemouse = pyspacemouse
+                    self.device = None
+                    self._base_env_ref = base_env_ref
+                    # 状态管理属性
+                    self._in_act_mode = False
+                    self._in_sync_mode = False
+                    self._reverse_enabled = False
+                    self._open()
+                
+                def _open(self):
+                    """打开设备"""
+                    self.device = self.pyspacemouse.open()
+                    if not self.device:
+                        raise RuntimeError("无法打开 SpaceMouse 设备，请确保设备已连接")
+                
+                def read(self):
+                    """读取当前状态，返回 SpaceNavigator namedtuple"""
+                    if not self.device:
+                        self._open()
+                    return self.pyspacemouse.read()
+                
+                def get_state(self):
+                    """获取状态（read() 的别名）"""
+                    return self.read()
+                
+                def get(self):
+                    """获取状态（read() 的别名）"""
+                    return self.read()
+                
+                def get_delta(self):
+                    """
+                    获取 SpaceMouse 的相对增量输入
+                    
+                    返回:
+                        dict: {
+                            'delta_pos': np.array([x, y, z]),  # 相对位置增量 (m)
+                            'delta_rot': np.array([roll, pitch, yaw]),  # 相对旋转增量 (rad)
+                            'gripper_delta': float  # 夹爪增量
+                        }
+                    """
+                    if self._base_env_ref is None:
+                        raise RuntimeError("SpaceMouse.get_delta() 需要 base_env_ref，请在 init_xtele() 中传递")
+                    
+                    base_env = self._base_env_ref()
+                    if base_env is None:
+                        raise RuntimeError("BaseEnv 引用已失效")
+                    
+                    # 读取 SpaceMouse 状态
+                    try:
+                        state = self.read()
+                        if state is None:
+                            # 设备未打开，返回零增量
+                            return {
+                                'delta_pos': np.zeros(3),
+                                'delta_rot': np.zeros(3),
+                                'gripper_delta': 0.0
+                            }
+                    except Exception as e:
+                        print(f"Warning: Failed to read SpaceMouse state in get_delta(): {e}")
+                        # 返回零增量
+                        return {
+                            'delta_pos': np.zeros(3),
+                            'delta_rot': np.zeros(3),
+                            'gripper_delta': 0.0
+                        }
+                    
+                    # 提取SpaceMouse输入（相对增量，不进行缩放）
+                    # 缩放会在 HumanIntervention wrapper 中使用 action_scale 进行
+                    delta_pos = np.zeros(3)
+                    delta_rot = np.zeros(3)
+                    gripper_delta = 0.0
+                    
+                    if hasattr(state, 'x') or hasattr(state, 't'):
+                        # state是对象，常见属性名: x/y/z 或 t/r (translation/rotation)
+                        if hasattr(state, 'x'):
+                            delta_pos = np.array([state.x, state.y, state.z])
+                        elif hasattr(state, 't') and isinstance(state.t, (list, np.ndarray)) and len(state.t) >= 3:
+                            delta_pos = np.array(state.t[:3])
+                        
+                        if hasattr(state, 'roll'):
+                            delta_rot = np.array([state.roll, state.pitch, state.yaw])
+                        elif hasattr(state, 'r') and isinstance(state.r, (list, np.ndarray)) and len(state.r) >= 3:
+                            delta_rot = np.array(state.r[:3])
+                        
+                        # 按钮控制夹爪
+                        if hasattr(state, 'buttons'):
+                            buttons = state.buttons if isinstance(state.buttons, (list, np.ndarray)) else [state.buttons]
+                            if len(buttons) >= 2:
+                                gripper_delta = buttons[0] - buttons[1]
+                        elif hasattr(state, 'button'):
+                            gripper_delta = state.button
+                    elif isinstance(state, dict):
+                        # state是字典
+                        delta_pos = np.array([
+                            state.get('x', state.get('t', [0, 0, 0])[0] if isinstance(state.get('t'), (list, np.ndarray)) else 0),
+                            state.get('y', state.get('t', [0, 0, 0])[1] if isinstance(state.get('t'), (list, np.ndarray)) else 0),
+                            state.get('z', state.get('t', [0, 0, 0])[2] if isinstance(state.get('t'), (list, np.ndarray)) else 0)
+                        ])
+                        delta_rot = np.array([
+                            state.get('roll', state.get('r', [0, 0, 0])[0] if isinstance(state.get('r'), (list, np.ndarray)) else 0),
+                            state.get('pitch', state.get('r', [0, 0, 0])[1] if isinstance(state.get('r'), (list, np.ndarray)) else 0),
+                            state.get('yaw', state.get('r', [0, 0, 0])[2] if isinstance(state.get('r'), (list, np.ndarray)) else 0)
+                        ])
+                        buttons = state.get('buttons', state.get('button', [0, 0]))
+                        if isinstance(buttons, (list, np.ndarray)) and len(buttons) >= 2:
+                            gripper_delta = buttons[0] - buttons[1]
+                        elif isinstance(buttons, (int, float)):
+                            gripper_delta = buttons
+                    elif isinstance(state, (list, tuple, np.ndarray)):
+                        # state是数组 [x, y, z, roll, pitch, yaw, button1, button2] 或 [t, r, buttons]
+                        state_array = np.array(state)
+                        if len(state_array) >= 6:
+                            delta_pos = state_array[:3]
+                            delta_rot = state_array[3:6]
+                            if len(state_array) >= 8:
+                                gripper_delta = state_array[6] - state_array[7]
+                        elif len(state_array) == 2:
+                            # [translation, rotation]
+                            if isinstance(state_array[0], (list, np.ndarray)) and len(state_array[0]) >= 3:
+                                delta_pos = np.array(state_array[0][:3])
+                            if isinstance(state_array[1], (list, np.ndarray)) and len(state_array[1]) >= 3:
+                                delta_rot = np.array(state_array[1][:3])
+                    
+                    # 应用反向标志
+                    if self._reverse_enabled:
+                        delta_pos = -delta_pos
+                        delta_rot = -delta_rot
+                    
+                    return {
+                        'delta_pos': delta_pos,
+                        'delta_rot': delta_rot,
+                        'gripper_delta': gripper_delta
+                    }
+                
+                def act(self):
+                    """
+                    返回末端位姿的增量向量
+                    
+                    直接从 SpaceMouse 获取相对增量，拼接成向量返回：
+                    [delta_pos_x, delta_pos_y, delta_pos_z, delta_rot_roll, delta_rot_pitch, delta_rot_yaw, gripper_delta]
+                    
+                    注意：此方法返回的是增量，不是绝对位姿或关节角度。
+                    绝对位姿应该从机器人本体获取，然后加上这个增量。
+                    """
+                    # 获取相对增量
+                    delta = self.get_delta()
+                    
+                    # 将增量拼接成向量：[位置增量(3) + 旋转增量(3) + 夹爪增量(1)] = 7维
+                    pose_delta = np.concatenate([
+                        delta['delta_pos'],      # [x, y, z] - 位置增量 (m)
+                        delta['delta_rot'],      # [roll, pitch, yaw] - 旋转增量 (rad)
+                        [delta['gripper_delta']] # [gripper] - 夹爪增量
+                    ])
+                    
+                    return pose_delta
+                
+                def switch_act(self):
+                    """切换到动作模式（标记状态，SpaceMouse 不需要实际切换）"""
+                    self._in_act_mode = True
+                    self._in_sync_mode = False
+                
+                def exit_any_sync(self):
+                    """退出同步模式（标记状态，SpaceMouse 不需要实际退出）"""
+                    self._in_sync_mode = False
+                    self._in_act_mode = True
+                
+                def switch_reverse(self):
+                    """切换反向模式（添加反向标志）"""
+                    self._reverse_enabled = not self._reverse_enabled
+                
+                def sync_position(self, goal_joints):
+                    """
+                    同步位置到目标关节角度
+                    
+                    TODO: SpaceMouse 是相对输入设备，无法同步绝对位置。
+                    此方法仅用于接口兼容性，实际不执行任何操作。
+                    可以考虑通过视觉反馈或其他方式提示用户手动调整。
+                    """
+                    # SpaceMouse 是相对输入设备，无法同步绝对位置
+                    # 此方法仅用于接口兼容性
+                    pass
+                
+                def sync_position_torque(self, goal_joints):
+                    """
+                    同步位置到目标关节角度（带力矩控制）
+                    
+                    TODO: SpaceMouse 是相对输入设备，无法同步绝对位置。
+                    此方法仅用于接口兼容性，实际不执行任何操作。
+                    可以考虑通过视觉反馈或其他方式提示用户手动调整。
+                    """
+                    # SpaceMouse 是相对输入设备，无法同步绝对位置
+                    # 此方法仅用于接口兼容性
+                    pass
+                
+                def reset(self):
+                    """重置设备状态（SpaceMouse 是相对输入，重新打开设备）"""
+                    if self.device:
+                        self.pyspacemouse.close()
+                        self.device = None
+                    self._open()
+                
+                def close(self):
+                    """关闭设备"""
+                    if self.device:
+                        self.pyspacemouse.close()
+                        self.device = None
+                
+                def __del__(self):
+                    """析构时关闭设备"""
+                    try:
+                        self.close()
+                    except:
+                        pass
+            
+            import weakref
+            self.tele_agent = SpaceMouse(base_env_ref=weakref.ref(self))
         else:   
             raise NotImplementedError("Unknown robot type")
 
@@ -246,7 +592,23 @@ class BaseEnv(gym.Env):
             for p in path:
                 self.tele_agent.sync_position_torque(p)
                 time.sleep(0.02)
-
+        elif 'a2d' in self.robot_type:
+            pass
+            # # 与 franka 保持一致：获取当前关节，然后同步到目标
+            # # TODO: SpaceMouse 是相对输入设备，无法同步绝对位置
+            # # sync_position_torque() 方法仅用于接口兼容性，实际不执行任何操作
+            # tele_cur_joints = self.tele_agent.act()
+            # tele_tar_joints = goal
+            # timeout = int(timeout // 0.02)
+            # if timeout <= 1:
+            #     path = np.array([tele_tar_joints])
+            # else:
+            #     path = np.linspace(tele_cur_joints, tele_tar_joints, timeout)
+            # for p in path:
+            #     # TODO: SpaceMouse 是相对输入设备，无法同步绝对位置
+            #     # sync_position_torque() 方法仅用于接口兼容性
+            #     self.tele_agent.sync_position_torque(p)
+            #     time.sleep(0.02)
         else:
             raise NotImplementedError("Unknown robot type")    
 
@@ -373,23 +735,127 @@ class BaseEnv(gym.Env):
         """
         Move to the rest position defined in base class.
         Add a small z offset before going to rest to avoid collision with object.
-        """        
+        """
         # perform joint reset if needed
         self._update_currpos()
         curr_pose = self.currpos.copy()
         curr_pose = self.pose_quat2euler(curr_pose)
-        # reset_pose = self._reset_pose.copy()
+        reset_pose = self._reset_pose.copy()
 
         # if np.linalg.norm(curr_pose - reset_pose) > 0.15 or joint_reset:
         assert self._reset_joint.shape == (self.joint_dim,)
-        if "ur" in self.robot_type:
+        
+        if "a2d" in self.robot_type.lower():
+            try:
+                # 使用末端位置控制进行重置
+                use_ee_control = (
+                    hasattr(self, 'robot_controller') and self.robot_controller is not None
+                )
+
+                if use_ee_control:
+                    try:
+                        # 步骤1: 获取当前末端位姿（使用统一方法）
+                        current_ee_pose = self._get_current_ee_pose()
+                        goal_ee_pose = self._reset_pose.copy()
+
+                        # 问题4: 在生成路径前，先检查并限制目标位姿
+                        goal_pose_6d = np.concatenate([
+                            goal_ee_pose[:3],
+                            Rotation.from_quat(goal_ee_pose[3:]).as_euler("xyz")
+                        ])
+                        goal_pose_clipped_6d = self.clip_safety_box(goal_pose_6d)
+                        goal_ee_pose_clipped = np.concatenate([
+                            goal_pose_clipped_6d[:3],
+                            Rotation.from_euler("xyz", goal_pose_clipped_6d[3:]).as_quat()
+                        ])
+                        
+                        # 问题7: 预先计算当前和目标位姿的欧拉角（性能优化）
+                        current_euler = Rotation.from_quat(current_ee_pose[3:]).as_euler("xyz")
+                        goal_euler = goal_pose_clipped_6d[3:]  # 已经是欧拉角，无需转换
+
+                        # 步骤3: 生成平滑的末端位姿路径（从当前位置到目标位置）
+                        cnt = int(3 / (1 / self.hz))
+                        pos_path = np.linspace(current_ee_pose[:3], goal_ee_pose_clipped[:3], cnt)
+                        euler_path = np.linspace(current_euler, goal_euler, cnt)
+                        
+                        # 步骤4: 使用末端位姿控制平滑移动到目标位置
+                        for i in range(cnt):
+                            target_pos = pos_path[i]
+                            target_euler = euler_path[i]
+                            
+                            # 应用边界限制（双重检查，确保安全）
+                            pose_6d = np.concatenate([target_pos, target_euler])
+                            pose_clipped = self.clip_safety_box(pose_6d)
+                            
+                            # 转换回四元数
+                            clipped_pos = pose_clipped[:3]
+                            clipped_quat = Rotation.from_euler("xyz", pose_clipped[3:6]).as_quat()
+                            
+                            right_pose_clipped = {
+                                'x': clipped_pos[0], 'y': clipped_pos[1], 'z': clipped_pos[2],
+                                'qx': clipped_quat[0], 'qy': clipped_quat[1], 'qz': clipped_quat[2], 'qw': clipped_quat[3]
+                            }
+                            
+                            # 使用 robot_controller 进行末端位姿控制
+                            lifetime = max(1.0 / self.hz, 0.1)
+                            self.robot_controller.set_end_effector_pose_control(
+                                lifetime=lifetime,
+                                control_group=['right_arm'],
+                                left_pose=None,
+                                right_pose=right_pose_clipped
+                            )
+                            time.sleep(1 / self.hz)
+                        
+                        print_green("A2D: Reset completed using end-effector pose control")
+                    except Exception as e:
+                        print(f"Warning: A2D end-effector reset failed: {e}, falling back to joint control")
+                        # use_ee_control = True
+                
+                # 如果末端控制失败，回退到关节控制
+                if not use_ee_control:
+                    # 获取当前关节状态
+                    current_arm_joints, _ = self.robot_station.arm_joint_states()
+                    current_waist_joints, _ = self.robot_station.waist_joint_states()
+                    current_left_arm_joints = np.array(current_arm_joints[:self.joint_dim])
+                    current_right_arm_joints = np.array(current_arm_joints[self.joint_dim:2*self.joint_dim])
+                    
+                    # 目标关节位置（右臂）
+                    goal_joints = self._reset_joint.copy()
+                
+                    cnt = int(self.hz)
+                    path = np.linspace(current_right_arm_joints, goal_joints, cnt)
+                    
+                    for p in path:
+                        self.robot_station.move_arm(np.concatenate([current_left_arm_joints, p.tolist()]).tolist())
+                        time.sleep(1 / self.hz)
+                
+                # 控制手部、头部和腰部
+                if hasattr(self.config, 'reset_hand_positions'):
+                    hand_positions = self.config.reset_hand_positions
+                    self.robot_station.move_hand(hand_positions)
+                
+                if hasattr(self.config, 'reset_head_positions') and hasattr(self.config, 'reset_waist_positions'):
+                    self.robot_station.move_head_and_waist(
+                        self.config.reset_head_positions,
+                        self.config.reset_waist_positions
+                    )
+                
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Warning: A2D reset failed: {e}")
+                traceback.print_exc()
+        elif "ur" in self.robot_type:
             arm_joints = np.append(self.curr_arm_joints, self.last_gripper_value)
             for _ in range(5):
                 self._send_joint_command(arm_joints, include_gripper=False)
                 time.sleep(1 / self.hz)
                 
             for name, _robot in self.robot_station.get_robot_handle().items():
-                goal_joints = Joints(self._reset_joint, num_of_dofs=self.joint_dim)
+                if Joints is not None:
+                    goal_joints = Joints(self._reset_joint, num_of_dofs=self.joint_dim)
+                else:
+                    goal_joints = self._reset_joint
                 try:
                     return_val =_robot.reach_target_joint(goal_joints)
                 except Exception as e:
@@ -436,7 +902,20 @@ class BaseEnv(gym.Env):
         gripper_value_binary = 1.0 if gripper_value >= 0.5 else 0.0
         if include_gripper:
             self.last_gripper_value = gripper_value_binary
-        if "ur" in self.robot_type:
+        
+        if "a2d" in self.robot_type.lower():
+            if len(joints) >= self.joint_dim:
+                arm_joints = joints[0:self.joint_dim].tolist()
+                self.robot_station.move_arm(arm_joints)
+                return {
+                    "arm_joints": {"single": np.array(arm_joints)},
+                    "hand_joints": {"single": np.array([self.last_gripper_value])},
+                    "arm_pose": {"single": self.currpos if hasattr(self, 'currpos') else np.zeros(7)},
+                    "images": {}
+                }
+            else:
+                raise ValueError(f"A2D: Expected at least {self.joint_dim} joints, got {len(joints)}")
+        elif "ur" in self.robot_type:
             robot_target = {
                 "arm_joints": {
                     "single": joints[0:self.joint_dim]
@@ -464,7 +943,95 @@ class BaseEnv(gym.Env):
             gripper_value_binary = 1.0 if pose[-1] >= 0.5 else 0.0
             self.last_gripper_value = gripper_value_binary
 
-        if "ur" in self.robot_type:
+        if "a2d" in self.robot_type.lower():
+            if len(pose) < 6:
+                print("Warning: A2D pose control requires at least 6 dimensions (xyz + rpy)")
+                return {
+                    "arm_joints": {"single": np.zeros(self.joint_dim)},
+                    "hand_joints": {"single": np.array([self.last_gripper_value])},
+                    "arm_pose": {"single": np.append(pose[:3] if len(pose) >= 3 else [0, 0, 0], [0, 0, 0, 1])},
+                    "images": {}
+                }
+            
+            # 在发送给机器人之前，先进行边界限制
+            # 注意：这里 pose 可能是 6维 (xyz + rpy) 或 7维 (xyz + rpy + gripper)
+            pose_clipped = self.clip_safety_box(pose.copy())
+            
+            # 转换位姿格式：6维 (xyz + rpy) 或 7维 (xyz + quat) -> 7维 (xyz + quat)
+            if len(pose_clipped) == 6:
+                pos = pose_clipped[:3]
+                euler = pose_clipped[3:6]
+                quat = Rotation.from_euler("xyz", euler).as_quat()
+                target_pose = np.concatenate([pos, quat])
+            else:
+                # 7维格式：可能是 xyz + rpy + gripper 或 xyz + quat + gripper
+                # 检查第4-6维是否是欧拉角（通常范围较大）还是四元数（通常在[-1,1]）
+                if np.all(np.abs(pose_clipped[3:6]) <= 1.0) and len(pose_clipped) == 7:
+                    # 可能是四元数格式（前3个分量）
+                    target_pose = pose_clipped[:7]
+                else:
+                    # 可能是欧拉角格式，需要转换
+                    pos = pose_clipped[:3]
+                    euler = pose_clipped[3:6]
+                    quat = Rotation.from_euler("xyz", euler).as_quat()
+                    target_pose = np.concatenate([pos, quat])
+            
+            # 构建位姿字典
+            right_pose = {
+                'x': target_pose[0], 'y': target_pose[1], 'z': target_pose[2],
+                'qx': target_pose[3], 'qy': target_pose[4], 'qz': target_pose[5], 'qw': target_pose[6]
+            }
+            
+            # 优先使用 robot_controller 进行末端位姿控制
+            use_robot_controller = hasattr(self, 'robot_controller') and self.robot_controller is not None
+            
+            if use_robot_controller:
+                try:
+                    # 计算 lifetime（基于控制频率，通常设置为 1-2 个控制周期）
+                    lifetime = max(1.0 / self.hz, 0.1)  # 至少 0.1 秒
+                    
+                    # 使用 robot_controller 进行末端位姿控制
+                    self.robot_controller.set_end_effector_pose_control(
+                        lifetime=lifetime,
+                        control_group=['right_arm'],
+                        left_pose=None,
+                        right_pose=right_pose
+                    )
+                except Exception as e:
+                    print(f"Warning: A2D robot_controller pose control failed: {e}, falling back to IK")
+                    # use_robot_controller = False
+            
+            # 如果 robot_controller 不可用或失败，回退到手动 IK 方案
+            if not use_robot_controller:
+                if hasattr(self, 'ik') and self.ik is not None:
+                    try:
+                        arm_joints, _ = self.robot_station.arm_joint_states()
+                        waist_joints, _ = self.robot_station.waist_joint_states()
+                        current_joints = list(arm_joints) + list(waist_joints)
+                        
+                        joint_command = self.ik.compute_inverse_kinematics(
+                            control_group=['right_arm'],
+                            left_pose=None,
+                            right_pose=right_pose,
+                            initial_joints=current_joints
+                        )
+                        
+                        if joint_command is not None:
+                            self.robot_station.move_arm(joint_command[:14].tolist())
+                        else:
+                            print("Warning: A2D IK solve failed, skipping action")
+                    except Exception as e:
+                        print(f"Warning: A2D IK-based pose control failed: {e}")
+                else:
+                    print("Warning: A2D end-effector control requires robot_controller or IK solver, currently disabled")
+            obs = self._get_obs()
+            return {
+                "arm_joints": {"single": obs['state']['joints']},
+                "hand_joints": {"single": obs['state']['gripper_pose']},
+                "arm_pose": {"single": obs['state']['tcp_pose']},
+                "images": obs['images']
+            }
+        elif "ur" in self.robot_type:
             robot_target = {
                 "arm_pose": {
                     "single": pose[0:6]
@@ -491,15 +1058,84 @@ class BaseEnv(gym.Env):
         return obs
 
 
+    def _get_current_ee_pose(self) -> np.ndarray:
+        """
+        获取当前末端位姿的统一方法（问题6：消除代码重复）
+        
+        Returns:
+            np.ndarray: 当前末端位姿 [x, y, z, qx, qy, qz, qw]
+        """
+        # 优先使用 robot_controller.get_motion_status()
+        if hasattr(self, 'robot_controller') and self.robot_controller is not None:
+            try:
+                current_states = self.robot_controller.get_motion_status()
+                current_right_ee_frame = current_states['frames']['arm_right_link7']
+                current_pos = current_right_ee_frame['position']
+                current_quat = current_right_ee_frame['orientation']['quaternion']
+                return np.array([
+                    current_pos['x'], current_pos['y'], current_pos['z'],
+                    current_quat['x'], current_quat['y'], current_quat['z'], current_quat['w']
+                ])  # [x, y, z, qx, qy, qz, qw]
+            except Exception as e:
+                print(f"Warning: Failed to get EE pose from robot_controller: {e}")
+        
+        # 回退到正向运动学计算
+        if hasattr(self, 'robot_station') and hasattr(self, 'joint2ee') and self.joint2ee is not None:
+            try:
+                arm_joints, _ = self.robot_station.arm_joint_states()
+                waist_joints, _ = self.robot_station.waist_joint_states()
+                joint_positions = np.concatenate([arm_joints, waist_joints]).reshape(1, -1)
+                _, _, right_pos, right_ori = self.joint2ee.compute_forward_kinematics(joint_positions)
+                return np.concatenate([right_pos[0], right_ori[0]])
+            except Exception as e:
+                print(f"Warning: Failed to compute EE pose from FK: {e}")
+        
+        # 最终回退
+        return np.array([0.5, 0.0, 0.8, 0, 0, 0, 1])
+
     def _update_currpos(self, obs=None):
         """
         Internal function to get the latest state of the robot and its gripper.
         """
         if obs is None:
             obs = self._get_obs_from_robot()
-        self.currpos = obs["arm_pose"]['single']
-        self.curr_gripper_joints = np.array(obs["hand_joints"]['single']).squeeze()
-        self.curr_arm_joints = np.array(obs["arm_joints"]['single'][0:self.joint_dim])
+        
+        if "a2d" in self.robot_type.lower():
+            if "arm_pose" in obs and 'single' in obs["arm_pose"]:
+                self.currpos = obs["arm_pose"]['single']
+            else:
+                # 使用统一的获取方法（问题6：消除代码重复）
+                self.currpos = self._get_current_ee_pose()
+            
+            if "hand_joints" in obs and 'single' in obs["hand_joints"]:
+                self.curr_gripper_joints = np.array(obs["hand_joints"]['single']).squeeze()
+            else:
+                if hasattr(self, 'robot_station') and self.robot_station is not None:
+                    try:
+                        hand_states, _ = self.robot_station.hand_joint_states()
+                        self.curr_gripper_joints = np.array(hand_states[6:12] if len(hand_states) > 6 else hand_states[:6]).mean()
+                    except:
+                        self.curr_gripper_joints = np.array([0.0])
+                else:
+                    self.curr_gripper_joints = np.array([0.0])
+            
+            if "arm_joints" in obs and 'single' in obs["arm_joints"]:
+                self.curr_arm_joints = np.array(obs["arm_joints"]['single'][0:self.joint_dim])
+            else:
+                if hasattr(self, 'robot_station') and self.robot_station is not None:
+                    try:
+                        arm_joints, _ = self.robot_station.arm_joint_states()
+                        self.curr_arm_joints = np.array(arm_joints[:self.joint_dim])
+                    except:
+                        self.curr_arm_joints = np.zeros(self.joint_dim)
+                else:
+                    self.curr_arm_joints = np.zeros(self.joint_dim)
+        else:
+            # 原有的逻辑（Franka/UR）
+            self.currpos = obs["arm_pose"]['single']
+            self.curr_gripper_joints = np.array(obs["hand_joints"]['single']).squeeze()
+            self.curr_arm_joints = np.array(obs["arm_joints"]['single'][0:self.joint_dim])
+        
         return obs
 
     def _get_obs(self, obs=None) -> dict:
@@ -516,8 +1152,12 @@ class BaseEnv(gym.Env):
             for key, cap in obs["images"].items():
                 if key not in self._image_keys:
                     continue
-                rgb, _ = decoder_image(cap, None, bgr2rgb=self._bgr2rgb)
-                images[key] = rgb 
+                if "a2d" in self.robot_type.lower():
+                    rgb = cap
+                    images[key] = cap
+                else:
+                    rgb, _ = decoder_image(cap, None, bgr2rgb=self._bgr2rgb)
+                    images[key] = rgb 
                 if not os.path.exists(f"online_image_{key}.png"):
                     cv2.imwrite(f"online_image_{key}.png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
             state_observation = {
@@ -530,15 +1170,83 @@ class BaseEnv(gym.Env):
         return dict(images=images, state=state_observation)
 
     def _get_obs_from_robot(self) -> dict:
-        obs = self.robot_station.get_obs()
-        
-        # standardize arm_pose
-        arm_pose = obs['arm_pose']['single']
-        arm_pose_t, arm_pose_quat = arm_pose[0:3], arm_pose[3:]
-        arm_pose_quat = Rotation.from_quat(arm_pose_quat).as_quat(canonical=True)
-        arm_pose = np.hstack([arm_pose_t, arm_pose_quat])
-        obs['arm_pose'] = {'single': arm_pose}
-        return obs
+        if "a2d" in self.robot_type.lower():
+            obs = {}
+            
+            try:
+                arm_joints, _ = self.robot_station.arm_joint_states()
+                waist_joints, _ = self.robot_station.waist_joint_states()
+                hand_states, _ = self.robot_station.hand_joint_states()
+                
+                # 使用统一的获取方法（问题6：消除代码重复）
+                arm_pose = self._get_current_ee_pose()
+                
+                obs['arm_joints'] = {'single': np.array(arm_joints[self.joint_dim:2*self.joint_dim])}
+                obs['arm_pose'] = {'single': arm_pose}
+                if len(hand_states) > 6:
+                    obs['hand_joints'] = {'single': np.array([np.mean(hand_states[6:12])])}
+                else:
+                    obs['hand_joints'] = {'single': np.array([0.0])}
+                
+            except Exception as e:
+                print(f"Warning: A2D state retrieval failed: {e}")
+                obs['arm_joints'] = {'single': np.zeros(self.joint_dim)}
+                obs['arm_pose'] = {'single': np.array([0.5, 0.0, 0.8, 0, 0, 0, 1])}
+                obs['hand_joints'] = {'single': np.array([0.0])}
+            
+            obs['images'] = {}
+            if hasattr(self, 'camera_group') and self.camera_group is not None:
+                try:
+                    for camera_name in self.config.image_keys:
+                        camera_mapping = {
+                            'right': '/camera/hand_right_color',
+                            'wrist': '/camera/hand_right_color',
+                            'head': '/camera/head_color',
+                            'left': '/camera/hand_left_color',
+                        }
+                        a2d_camera_name = camera_mapping.get(camera_name, f'/camera/{camera_name}_color')
+                        
+                        camera_image, _ = self.camera_group.get_latest_image(a2d_camera_name)
+                        if camera_image is not None:
+                            # target_size = self.config.image_resize.get(camera_name, [128, 128, 3])
+                            # if len(target_size) == 3:
+                            #     h, w = target_size[0], target_size[1]
+                            # else:
+                            #     h, w = 128, 128
+                            
+                            from PIL import Image
+                            # camera_image = Image.fromarray(camera_image).resize((w, h))
+                            camera_image = Image.fromarray(camera_image)
+                            camera_image = np.array(camera_image)
+                            obs['images'][camera_name] = camera_image
+                        else:
+                            target_size = self.config.image_resize.get(camera_name, [128, 128, 3])
+                            h, w = target_size[0], target_size[1] if len(target_size) > 1 else 128
+                            obs['images'][camera_name] = np.zeros((h, w, 3), dtype=np.uint8)
+                except Exception as e:
+                    print(f"Warning: A2D image retrieval failed: {e}")
+                    for camera_name in self.config.image_keys:
+                        target_size = self.config.image_resize.get(camera_name, [128, 128, 3])
+                        h, w = target_size[0], target_size[1] if len(target_size) > 1 else 128
+                        obs['images'][camera_name] = np.zeros((h, w, 3), dtype=np.uint8)
+            else:
+                for camera_name in self.config.image_keys:
+                    target_size = self.config.image_resize.get(camera_name, [128, 128, 3])
+                    h, w = target_size[0], target_size[1] if len(target_size) > 1 else 128
+                    obs['images'][camera_name] = np.zeros((h, w, 3), dtype=np.uint8)
+            
+            return obs
+        else:
+            # 原有的逻辑（Franka/UR）
+            obs = self.robot_station.get_obs()
+            
+            # standardize arm_pose
+            arm_pose = obs['arm_pose']['single']
+            arm_pose_t, arm_pose_quat = arm_pose[0:3], arm_pose[3:]
+            arm_pose_quat = Rotation.from_quat(arm_pose_quat).as_quat(canonical=True)
+            arm_pose = np.hstack([arm_pose_t, arm_pose_quat])
+            obs['arm_pose'] = {'single': arm_pose}
+            return obs
 
     def close(self):
         return
