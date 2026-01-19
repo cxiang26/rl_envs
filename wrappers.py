@@ -71,9 +71,9 @@ class HumanIntervention(gym.ActionWrapper):
                     
                     # 直接使用增量向量，归一化后作为动作
                     expert_a = np.zeros(7, dtype=np.float32)
-                    expert_a[:3] = delta_pos / self.env.unwrapped.action_scale[0]
-                    expert_a[3:6] = delta_rot / self.env.unwrapped.action_scale[1]
-                    expert_a[6:] = gripper_delta / self.env.unwrapped.action_scale[2]
+                    expert_a[:3] = delta_pos
+                    expert_a[3:6] = delta_rot
+                    expert_a[6:] = gripper_delta
                     
                     # 边缘裁剪
                     epsilon = 1e-6
