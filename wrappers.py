@@ -127,6 +127,149 @@ class HumanIntervention(gym.ActionWrapper):
         return obs, rew, terminated, truncated, info
 
 
+class SpaceMouseIntervention(gym.ActionWrapper):
+    """
+    SpaceMouse干预包装器，直接使用pyspacemouse读取输入，避免嵌套调用导致的延迟。
+    直接读取SpaceMouse的增量值作为动作，不需要考虑joints。
+    """
+    def __init__(self, env, action_indices=None):
+        super().__init__(env)
+        self.robot_type = env.unwrapped.robot_type
+        self.control_mode = env.unwrapped.control_mode
+        self.enable_rotation = env.unwrapped.enable_rotation
+        
+
+    def read_latest(self):
+        """
+        读取最新状态，减少缓冲区读取次数以降低延迟
+        """
+        latest_state = None
+        for _ in range(3):
+            state = self.pyspacemouse.read()
+            if state is not None:
+                latest_state = state
+        return latest_state
+
+    def get_delta(self):
+        """
+        读取SpaceMouse的增量值（阻塞式，持续等待直到读取到有效输入）
+        
+        返回: dict with 'delta_pos', 'delta_rot', 'gripper_delta'
+        """
+
+        # while True:
+        import pyspacemouse
+        try:
+            device =  pyspacemouse.open()
+            while True:
+                state = device.read()
+                
+                # 提取增量（调整坐标系：y 和 z 取反）
+                delta_pos = np.array([state.x, -state.y, -state.z])
+                delta_rot = np.array([state.roll, state.pitch, state.yaw])
+                
+                # 提取按钮状态
+                buttons = list(state.buttons) if state.buttons else []
+                if len(buttons) > 0 and (buttons[0] == 1 or buttons[1] == 1):
+                    gripper_delta = 1.0
+                else:
+                    gripper_delta = 0.0
+                has_button = any(b == 1 for b in buttons) if buttons else False
+                
+                # 检查是否有有效输入（降低阈值提高灵敏度）
+                has_movement = (np.abs(delta_pos).sum() > 0.1 or 
+                            np.abs(delta_rot).sum() > 0.1)
+                state_dict = {
+                    'delta_pos': delta_pos,
+                    'delta_rot': delta_rot,
+                    'gripper_delta': gripper_delta
+                }
+                # print("state:", state_dict, "has_movement:", has_movement, "has_button:", has_button)
+                # # 如果有有效输入，立即返回
+                if has_movement or has_button:
+                    has_movement = 0
+                    has_button = 0
+                    break
+
+                # 如果没有有效输入，短暂等待后继续读取
+                time.sleep(0.001)
+        except Exception as e:
+            print(f"Error in SpaceMouseIntervention.get_delta: {e}")
+            print(f"[{type(e).__name__}] {e!r}")
+            traceback.print_exc()
+            # sys.exit(1)
+            return None
+        finally:
+            pyspacemouse.close()
+            return state_dict
+
+    def reset(self, **kwargs):
+        """Reset the environment."""
+        obs, info = self.env.reset(**kwargs)
+        shared_state.human_intervention_key = False
+        info["is_intervention"] = False
+        return obs, info
+
+    def action(self, action: np.ndarray) -> np.ndarray:
+        """
+        检查是否需要干预，如果需要则直接从SpaceMouse读取增量作为动作
+        """
+        intervened = shared_state.human_intervention_key
+        if intervened:
+            try:
+                # 直接从SpaceMouse读取增量（阻塞式，等待有效输入）
+                delta = self.get_delta()
+                
+                # 直接使用增量向量作为动作
+                # 格式: [delta_pos(3), delta_rot(3), gripper_delta(1)]
+                expert_a = np.zeros(7, dtype=np.float32)
+                expert_a[:3] = delta['delta_pos']
+                expert_a[3:6] = delta['delta_rot']
+                expert_a[6] = delta['gripper_delta']
+                
+                # 边缘裁剪
+                epsilon = 1e-6
+                expert_a[0:6] = expert_a[0:6].clip(-1+epsilon, 1-epsilon)
+                
+                # 构建pose_delta用于返回（与HumanIntervention接口保持一致）
+                pose_delta = np.concatenate([
+                    delta['delta_pos'],
+                    delta['delta_rot'],
+                    [delta['gripper_delta']]
+                ])
+                
+                return expert_a, pose_delta, True
+            except Exception as e:
+                print(f"Error in SpaceMouseIntervention.action: {e}")
+                print(f"[{type(e).__name__}] {e!r}")
+                traceback.print_exc()
+                sys.exit(1)
+        
+        return action, None, False
+
+    def step(self, action):
+        """执行步骤，如果被干预则使用SpaceMouse输入，否则使用原动作"""
+        action, pose_delta, replaced = self.action(action)
+        if replaced:
+            obs, rew, terminated, truncated, info = self.env.step(action)
+            info["intervene_action"] = action
+        else:
+            obs, rew, terminated, truncated, info = self.env.step(action)
+        
+        info["is_intervention"] = replaced
+        return obs, rew, terminated, truncated, info
+
+    def close(self):
+        """关闭SpaceMouse设备"""
+        try:
+            if hasattr(self, 'pyspacemouse'):
+                self.pyspacemouse.close()
+        except:
+            pass
+
+    def __del__(self):
+        """析构时关闭设备"""
+        self.close()
 
 
 class AugmentedObservationWrapper(gym.ObservationWrapper):

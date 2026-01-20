@@ -2,6 +2,7 @@ from pathlib import Path
 import logging
 import json 
 import torch
+import numpy as np
 try:
     from torch.amp import GradScaler
     _GRADSCALER_HAS_DEVICE_PARAM = True
@@ -148,9 +149,9 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
 
         if not os.path.exists(f"online_right_image.png"):
             cv2.imwrite(f"online_right_image.png", obs["right"])
-            cv2.imwrite(f"online_wrist_image.png", obs["wrist"])
+            cv2.imwrite(f"online_head_image.png", obs["head"])
             print("online_right_image shape:", obs["right"].shape)
-            print("online_wrist_image shape:", obs["wrist"].shape)
+            print("online_head_image shape:", obs["head"].shape)
             print('online_right_image has been saved!!!!!!!!!!!')
         reward_obs = copy.deepcopy(obs)
         reward_obs = make_policy_obs(reward_obs, self.device, self.robot_type)

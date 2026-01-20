@@ -356,13 +356,11 @@ class BaseEnv(gym.Env):
                 
                 def read_latest(self):
                     """
-                    读取最新状态，自动清空缓冲区中的旧数据
-                    
-                    通过连续快速读取多次，确保获取的是最新数据而不是旧缓冲数据
+                    读取最新状态，减少缓冲区读取次数以降低延迟
                     """
-                    # 连续读取多次，只返回最后一次（最新的）
+                    # 快速读取3次（原来10次太多）
                     latest_state = None
-                    for _ in range(10):  # 读取 10 次，丢弃前 9 次
+                    for _ in range(3):
                         state = pyspacemouse.read()
                         if state is not None:
                             latest_state = state
@@ -394,9 +392,9 @@ class BaseEnv(gym.Env):
                             gripper_delta = 0.0
                         has_button = any(b == 1 for b in buttons) if buttons else False
                         
-                        # 检查是否有有效输入（累计值 > 0.2 或按钮按下）
-                        has_movement = (np.abs(delta_pos).sum() > 0.2 or 
-                                       np.abs(delta_rot).sum() > 0.2)
+                        # 检查是否有有效输入（降低阈值提高灵敏度）
+                        has_movement = (np.abs(delta_pos).sum() > 0.1 or 
+                                       np.abs(delta_rot).sum() > 0.1)
                         
                         if has_movement or has_button:
                             return {
@@ -510,12 +508,14 @@ class BaseEnv(gym.Env):
                         next_pos[3:6] = [3.14, 0, 0]
                     else:
                         raise NotImplementedError(f"Robot {self.robot_type} does not support disable_rotation mode")
-            
+            if not hasattr(self, 'pre_pos'):
+                self.pre_pos = curr_pose_euler
             # 线性插值：从当前位置到目标位置分N步执行（N可配置，默认10）
-            obs = self._send_pos_command_with_interpolation(
-                curr_pose_euler, next_pos, include_gripper, interp_steps=self.interp_steps
-            ) 
-            curr_pose_euler = self.pose_quat2euler(obs['arm_pose']['single'])
+            self._send_pos_command_with_interpolation(
+                self.pre_pos, next_pos, include_gripper, interp_steps=self.interp_steps
+            )
+            self.pre_pos = next_pos
+            # curr_pose_euler = self.pose_quat2euler(obs['arm_pose']['single'])
         else:
             raise NotImplementedError(f"Not valid control mode: {self.control_mode}")
 
@@ -526,9 +526,10 @@ class BaseEnv(gym.Env):
         self.curr_path_length += 1
 
         end_time = time.time()
-        sleep_time = max(0, 1/self.hz - (end_time - start_time))
+        sleep_time = max(0.01, 1/self.hz - (end_time - start_time))
         time.sleep(sleep_time)
         obs = self._get_obs()
+        curr_pose_euler = self.pose_quat2euler(obs['state']['tcp_pose'])
         
         reward = 0.0
         terminated = False
@@ -553,13 +554,13 @@ class BaseEnv(gym.Env):
                     continue  
             shared_state.terminate = False
             print("Reset the scene, press Space to continue...")
-            while not shared_state.terminate:
-                obs = self.get_xtele()
-                xtele_joints = obs['joints']
-                self._update_currpos()
-                target_joint = xtele_joints.copy()
-                self._send_joint_command(target_joint, include_gripper=True)
-                time.sleep(1 / self.hz)
+            # while not shared_state.terminate:
+            #     obs = self.get_xtele()
+            #     xtele_joints = obs['joints']
+            #     self._update_currpos()
+            #     target_joint = xtele_joints.copy()
+            #     self._send_joint_command(target_joint, include_gripper=True)
+            #     time.sleep(1 / self.hz)
             shared_state.terminate = False
             print('go to reset!!!!!!!!!!')
             self.go_to_reset(joint_reset=True)    
@@ -575,6 +576,7 @@ class BaseEnv(gym.Env):
         self.curr_path_length = 0
         self.last_gripper_act = time.time()
         self.last_gripper_value = 1.0 if self.close_gripper else 0.0
+        time.sleep(0.5)
         obs = self._get_obs(obs=None)
         return obs, {"success": False, "is_intervention": False}
 
@@ -761,19 +763,23 @@ class BaseEnv(gym.Env):
             # 如果当前位姿缺少夹爪维度，补0
             curr_pose = np.append(curr_pose, 0.0)
         
-        # 生成线性插值路径
-        interp_path = np.linspace(curr_pose, target_pose, interp_steps + 1)[1:]  # 不包含起点，只包含中间点和终点
+        # 生成平滑插值路径（使用smoothstep函数实现中间快、两端慢的过渡）
+        # smoothstep函数: t^2 * (3 - 2*t)，在[0,1]范围内，t=0时速度为0，t=0.5时速度最快，t=1时速度为0
+        t_linear = np.linspace(0, 1, interp_steps + 1)[1:]  # 不包含起点，只包含中间点和终点
+        t_smooth = t_linear ** 2 * (3 - 2 * t_linear)  # smoothstep函数
+        
+        # 使用平滑后的t值进行插值
+        # 使用列表推导式确保维度正确：生成(interp_steps, pose_dim)的数组
+        interp_path = np.array([curr_pose + (target_pose - curr_pose) * t for t in t_smooth])
         
         obs = None
         for i, interpolated_pose in enumerate(interp_path):
             # 对每个插值点发送命令
-            obs = self._send_pos_command(interpolated_pose, include_gripper)
+            self._send_pos_command(interpolated_pose, include_gripper)
             
             # 最后一步不需要等待
             if i < len(interp_path) - 1:
-                time.sleep(0.005)  # 插值步骤之间的小延迟，确保平滑执行
-        
-        return obs
+                time.sleep(0.01)  # 1ms延迟，保证机器人响应
     
     def _send_pos_command(self, pose: np.ndarray, include_gripper=False):
         if include_gripper:
