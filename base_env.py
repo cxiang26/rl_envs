@@ -769,8 +769,17 @@ class BaseEnv(gym.Env):
         t_smooth = t_linear ** 2 * (3 - 2 * t_linear)  # smoothstep函数
         
         # 使用平滑后的t值进行插值
-        # 使用列表推导式确保维度正确：生成(interp_steps, pose_dim)的数组
-        interp_path = np.array([curr_pose + (target_pose - curr_pose) * t for t in t_smooth])
+        # 只对前6个维度（位置和旋转）进行插值，最后一个维度（gripper）保持target_pose的值不变
+        interp_path = []
+        for t in t_smooth:
+            interpolated_pose = curr_pose.copy()
+            # 对前6个维度进行插值
+            interpolated_pose[:6] = curr_pose[:6] + (target_pose[:6] - curr_pose[:6]) * t
+            # 最后一个维度（gripper）保持target_pose的值不变
+            if len(target_pose) > 6:
+                interpolated_pose[6] = target_pose[6]
+            interp_path.append(interpolated_pose)
+        interp_path = np.array(interp_path)
         
         obs = None
         for i, interpolated_pose in enumerate(interp_path):
@@ -831,7 +840,7 @@ class BaseEnv(gym.Env):
             if use_robot_controller:
                 try:
                     # 计算 lifetime（基于控制频率，通常设置为 1-2 个控制周期）
-                    lifetime = max(1.0 / self.hz, 0.1)  # 至少 0.1 秒
+                    lifetime = max(1.0 / self.hz, 0.05)  # 至少 0.1 秒
                     
                     # 使用 robot_controller 进行末端位姿控制
                     self.robot_controller.set_end_effector_pose_control(
@@ -1034,7 +1043,7 @@ class BaseEnv(gym.Env):
                 }
                 
                 # 使用 robot_controller 进行末端位姿控制
-                lifetime = max(1.0 / self.hz, 0.1)
+                lifetime = max(1.0 / self.hz, 0.05)
                 self.robot_controller.set_end_effector_pose_control(
                     lifetime=lifetime,
                     control_group=['right_arm'],

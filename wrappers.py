@@ -137,7 +137,7 @@ class SpaceMouseIntervention(gym.ActionWrapper):
         self.robot_type = env.unwrapped.robot_type
         self.control_mode = env.unwrapped.control_mode
         self.enable_rotation = env.unwrapped.enable_rotation
-        
+        self.pre_button_state = 0
 
     def read_latest(self):
         """
@@ -175,14 +175,15 @@ class SpaceMouseIntervention(gym.ActionWrapper):
                 else:
                     gripper_delta = 0.0
                 has_button = any(b == 1 for b in buttons) if buttons else False
-                
+                if has_button:
+                    self.pre_button_state = 1 - self.pre_button_state
                 # 检查是否有有效输入（降低阈值提高灵敏度）
                 has_movement = (np.abs(delta_pos).sum() > 0.1 or 
                             np.abs(delta_rot).sum() > 0.1)
                 state_dict = {
                     'delta_pos': delta_pos,
                     'delta_rot': delta_rot,
-                    'gripper_delta': gripper_delta
+                    'gripper_delta': self.pre_button_state
                 }
                 # print("state:", state_dict, "has_movement:", has_movement, "has_button:", has_button)
                 # # 如果有有效输入，立即返回
