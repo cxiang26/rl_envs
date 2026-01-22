@@ -87,6 +87,7 @@ class BaseEnv(gym.Env):
         self.close_gripper = config.close_gripper
         self.fix_gripper = config.fix_gripper
         self.ego_mode = config.ego_mode
+        self.pre_pos = None
         assert self.control_mode in ["joint", "pose"], f'Not valid control mode: {self.control_mode}'
         
         self.fake_env = fake_env
@@ -508,7 +509,7 @@ class BaseEnv(gym.Env):
                         next_pos[3:6] = [3.14, 0, 0]
                     else:
                         raise NotImplementedError(f"Robot {self.robot_type} does not support disable_rotation mode")
-            if not hasattr(self, 'pre_pos'):
+            if self.pre_pos is None:
                 self.pre_pos = curr_pose_euler
             # 线性插值：从当前位置到目标位置分N步执行（N可配置，默认10）
             self._send_pos_command_with_interpolation(
@@ -573,6 +574,7 @@ class BaseEnv(gym.Env):
             #     continue
             shared_state.terminate = False
 
+        self.pre_pos = None
         self.curr_path_length = 0
         self.last_gripper_act = time.time()
         self.last_gripper_value = 1.0 if self.close_gripper else 0.0
@@ -700,7 +702,9 @@ class BaseEnv(gym.Env):
                 -self._random_rz_range, self._random_rz_range
             )
             reset_pose[3:] = axis_random
-            self._send_pos_command(reset_pose, include_gripper=False)
+            reset_pose = self.clip_safety_box(reset_pose)
+            self._send_pos_command_with_interpolation(self.pose_quat2euler(self._reset_pose.copy()), reset_pose, include_gripper=False, interp_steps=50)
+            # self._send_pos_command(reset_pose, include_gripper=False)
 
 
     def _send_joint_command(self, joints: np.ndarray, include_gripper=False):
@@ -1043,7 +1047,7 @@ class BaseEnv(gym.Env):
                 }
                 
                 # 使用 robot_controller 进行末端位姿控制
-                lifetime = max(1.0 / self.hz, 0.05)
+                lifetime = max(1.0 / self.hz, 0.1)
                 self.robot_controller.set_end_effector_pose_control(
                     lifetime=lifetime,
                     control_group=['right_arm'],
