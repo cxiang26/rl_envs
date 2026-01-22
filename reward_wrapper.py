@@ -111,6 +111,8 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
             origin_root_path = os.path.dirname(classifier_cfg.dataset_path)
             task_name = os.path.basename(classifier_cfg.dataset_path)
 
+            # 设置视频解码后端为 pyav，避免 torchcodec 兼容性问题
+            cfg.dataset.video_backend = "pyav"
     
             cfg.dataset.root = os.path.join(origin_root_path, task_name + "_success")
             success_dataset = make_dataset(cfg)
