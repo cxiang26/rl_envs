@@ -166,7 +166,7 @@ class SpaceMouseIntervention(gym.ActionWrapper):
                 
                 # 提取增量（调整坐标系：y 和 z 取反）
                 delta_pos = np.array([state.x, -state.y, -state.z])
-                delta_rot = np.array([state.roll, state.pitch, state.yaw])
+                delta_rot = np.array([state.pitch, state.roll, state.yaw])
                 
                 # 提取按钮状态
                 buttons = list(state.buttons) if state.buttons else []
