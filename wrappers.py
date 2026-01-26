@@ -137,7 +137,11 @@ class SpaceMouseIntervention(gym.ActionWrapper):
         self.robot_type = env.unwrapped.robot_type
         self.control_mode = env.unwrapped.control_mode
         self.enable_rotation = env.unwrapped.enable_rotation
-        self.pre_button_state = 0
+        # 初始化时从环境获取当前夹爪状态，而不是总是从 0 开始
+        if hasattr(env.unwrapped, 'last_gripper_value'):
+            self.pre_button_state = env.unwrapped.last_gripper_value
+        else:
+            self.pre_button_state = 0
 
     def read_latest(self):
         """
@@ -218,6 +222,11 @@ class SpaceMouseIntervention(gym.ActionWrapper):
         intervened = shared_state.human_intervention_key
         if intervened:
             try:
+                # 在切换到人工干预时，同步当前夹爪状态
+                # 避免切换时夹爪状态被重置为 0
+                if hasattr(self.env.unwrapped, 'last_gripper_value'):
+                    self.pre_button_state = self.env.unwrapped.last_gripper_value
+                
                 # 直接从SpaceMouse读取增量（阻塞式，等待有效输入）
                 delta = self.get_delta()
                 
