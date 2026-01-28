@@ -72,6 +72,8 @@ class BaseEnv(gym.Env):
         self.joint_dim = config.joint_dim
         self._reset_joint = np.array(config.reset_joint)[self.joint_dim:2*self.joint_dim]
         self._reset_pose = np.array(config.reset_joint)[self.joint_dim:2*self.joint_dim]
+        self._reset_left_pose = np.array(config.reset_joint)[0:self.joint_dim]
+        self.use_left_arm_reset = config.use_left_arm_reset if hasattr(config, 'use_left_arm_reset') else False
         self._random_xy_range = config.random_xy_range
         self._random_rz_range = config.random_rz_range
         self._random_reset = config.random_reset
@@ -150,8 +152,8 @@ class BaseEnv(gym.Env):
                         sys.path.insert(0, path)
                 
                 from a2d_sdk.robot import RobotDds, CosineCamera, RobotController
-                from robot_tools.kinematics.joint2ee import Joint2EE
-                from robot_tools.kinematics.ik import InverseKinematics
+                # from robot_tools.kinematics.joint2ee import Joint2EE
+                # from robot_tools.kinematics.ik import InverseKinematics
                 
                 self.robot_station = RobotDds()
                 self.robot_controller = RobotController()
@@ -172,14 +174,14 @@ class BaseEnv(gym.Env):
                     self.camera_group = None
                 
                 self.ik = None
-                if hasattr(config, 'control_mode') and config.control_mode == "pose":
-                    urdf_path = '/home/xcq/projects/HIL-RL/rl_envs/robot_tools/assets/G1_skillhands6_skillhands6_v1.5_corrected.urdf'
+                # if hasattr(config, 'control_mode') and config.control_mode == "pose":
+                #     urdf_path = '/home/xcq/projects/HIL-RL/rl_envs/robot_tools/assets/G1_skillhands6_skillhands6_v1.5_corrected.urdf'
                     
-                    if urdf_path:
-                        self.ik = InverseKinematics(urdf_path)
-                        print_green(f"A2D: Joint2EE and IK initialized with {urdf_path}")
-                    else:
-                        print_green("A2D: Warning - URDF file not found, EE control disabled")
+                #     if urdf_path:
+                #         self.ik = InverseKinematics(urdf_path)
+                #         print_green(f"A2D: Joint2EE and IK initialized with {urdf_path}")
+                #     else:
+                #         print_green("A2D: Warning - URDF file not found, EE control disabled")
                 
                 print_green("A2D robot initialized successfully")
                 
@@ -605,6 +607,12 @@ class BaseEnv(gym.Env):
                 )
 
                 if use_ee_control:
+                    if self.use_left_arm_reset:
+                        success = self._move_left_arm_to_pose_with_interpolation(
+                            target_pose=self._reset_left_pose.copy(),
+                            duration=3.0,
+                            use_ee_control=True
+                        )
                     # 使用插值函数平滑移动到重置位姿
                     success = self._move_to_pose_with_interpolation(
                         target_pose=self._reset_pose.copy(),
@@ -915,39 +923,42 @@ class BaseEnv(gym.Env):
         return obs
 
 
-    def _get_current_ee_pose(self) -> np.ndarray:
+    def _get_current_ee_pose(self, arm: str = 'right') -> np.ndarray:
         """
-        获取当前末端位姿的统一方法（问题6：消除代码重复）
-        
+        获取当前末端位姿的统一方法。
+
+        Args:
+            arm: 'left' 或 'right'，默认 'right'。
+
         Returns:
             np.ndarray: 当前末端位姿 [x, y, z, qx, qy, qz, qw]
         """
+        frame_key = 'arm_left_link7' if arm == 'left' else 'arm_right_link7'
         # 优先使用 robot_controller.get_motion_status()
         if hasattr(self, 'robot_controller') and self.robot_controller is not None:
             try:
                 current_states = self.robot_controller.get_motion_status()
-                current_right_ee_frame = current_states['frames']['arm_right_link7']
-                current_pos = current_right_ee_frame['position']
-                current_quat = current_right_ee_frame['orientation']['quaternion']
+                ee_frame = current_states['frames'][frame_key]
+                pos, quat = ee_frame['position'], ee_frame['orientation']['quaternion']
                 return np.array([
-                    current_pos['x'], current_pos['y'], current_pos['z'],
-                    current_quat['x'], current_quat['y'], current_quat['z'], current_quat['w']
-                ])  # [x, y, z, qx, qy, qz, qw]
+                    pos['x'], pos['y'], pos['z'],
+                    quat['x'], quat['y'], quat['z'], quat['w']
+                ])
             except Exception as e:
                 print(f"Warning: Failed to get EE pose from robot_controller: {e}")
-        
-        # 回退到正向运动学计算
+        # 回退到正向运动学: left_pos, left_ori, right_pos, right_ori
         if hasattr(self, 'robot_station') and hasattr(self, 'joint2ee') and self.joint2ee is not None:
             try:
                 arm_joints, _ = self.robot_station.arm_joint_states()
                 waist_joints, _ = self.robot_station.waist_joint_states()
                 joint_positions = np.concatenate([arm_joints, waist_joints]).reshape(1, -1)
-                _, _, right_pos, right_ori = self.joint2ee.compute_forward_kinematics(joint_positions)
+                left_pos, left_ori, right_pos, right_ori = self.joint2ee.compute_forward_kinematics(joint_positions)
+                if arm == 'left':
+                    return np.concatenate([left_pos[0], left_ori[0]])
                 return np.concatenate([right_pos[0], right_ori[0]])
             except Exception as e:
                 print(f"Warning: Failed to compute EE pose from FK: {e}")
-        
-        # 最终回退
+        # 最终回退（右手默认位姿）
         return np.array([0.5, 0.0, 0.8, 0, 0, 0, 1])
 
     def _move_to_pose_with_interpolation(
@@ -1060,6 +1071,79 @@ class BaseEnv(gym.Env):
             
         except Exception as e:
             print(f"Warning: A2D end-effector interpolation failed: {e}")
+            return False
+
+    def _move_left_arm_to_pose_with_interpolation(
+        self,
+        target_pose: np.ndarray,
+        duration: float = 3.0,
+        use_ee_control: bool = True,
+    ) -> bool:
+        """
+        将左臂从当前位置平滑插值移动到目标位姿。不使用范围限制（clip_safety_box）。
+
+        Args:
+            target_pose: 目标位姿，可为 7 维 [x,y,z,qx,qy,qz,qw] 或 6 维 [x,y,z,roll,pitch,yaw]
+            duration: 移动时长（秒），默认 3.0
+            use_ee_control: 是否用末端位姿控制，默认 True
+
+        Returns:
+            bool: 是否成功执行
+        """
+        if "a2d" not in self.robot_type.lower():
+            return False
+        if not use_ee_control:
+            return False
+        if not (hasattr(self, 'robot_controller') and self.robot_controller is not None):
+            return False
+
+        try:
+            current_ee_pose = self._get_current_ee_pose(arm='left')
+
+            if len(target_pose) == 7:
+                if np.all(np.abs(target_pose[3:6]) <= 1.0):
+                    goal_ee_pose = target_pose[:7].copy()
+                else:
+                    goal_ee_pose = np.concatenate([
+                        target_pose[:3],
+                        Rotation.from_euler("xyz", target_pose[3:6]).as_quat()
+                    ])
+            elif len(target_pose) == 6:
+                goal_ee_pose = np.concatenate([
+                    target_pose[:3],
+                    Rotation.from_euler("xyz", target_pose[3:6]).as_quat()
+                ])
+            else:
+                print(f"Warning: Invalid target_pose dimension: {len(target_pose)}, expected 6 or 7")
+                return False
+
+            current_euler = Rotation.from_quat(current_ee_pose[3:]).as_euler("xyz")
+            goal_euler = Rotation.from_quat(goal_ee_pose[3:]).as_euler("xyz")
+
+            cnt = max(1, int(duration / (1 / self.hz)))
+            pos_path = np.linspace(current_ee_pose[:3], goal_ee_pose[:3], cnt)
+            euler_path = np.linspace(current_euler, goal_euler, cnt)
+
+            for i in range(cnt):
+                pos = pos_path[i]
+                euler = euler_path[i]
+                quat = Rotation.from_euler("xyz", euler).as_quat()
+                left_pose = {
+                    'x': pos[0], 'y': pos[1], 'z': pos[2],
+                    'qx': quat[0], 'qy': quat[1], 'qz': quat[2], 'qw': quat[3]
+                }
+                lifetime = max(1.0 / self.hz, 0.1)
+                self.robot_controller.set_end_effector_pose_control(
+                    lifetime=lifetime,
+                    control_group=['left_arm'],
+                    left_pose=left_pose,
+                    right_pose=None
+                )
+                time.sleep(1 / self.hz)
+
+            return True
+        except Exception as e:
+            print(f"Warning: A2D left arm interpolation failed: {e}")
             return False
 
     def _update_currpos(self, obs=None):

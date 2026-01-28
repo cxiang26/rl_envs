@@ -2,7 +2,6 @@ from pathlib import Path
 import logging
 import json 
 import torch
-import numpy as np
 try:
     from torch.amp import GradScaler
     _GRADSCALER_HAS_DEVICE_PARAM = True
@@ -12,7 +11,8 @@ except ImportError:
 import time
 import gymnasium as gym
 import os
-import copy      
+import copy  
+import numpy as np    
 
 
 from lerobot.utils.buffer import ReplayBuffer, concatenate_batch_transitions
@@ -111,8 +111,6 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
             origin_root_path = os.path.dirname(classifier_cfg.dataset_path)
             task_name = os.path.basename(classifier_cfg.dataset_path)
 
-            # 设置视频解码后端为 pyav，避免 torchcodec 兼容性问题
-            cfg.dataset.video_backend = "pyav"
     
             cfg.dataset.root = os.path.join(origin_root_path, task_name + "_success")
             success_dataset = make_dataset(cfg)
@@ -149,12 +147,14 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         shared_state.terminate = False
         obs, info = self.env.reset(**kwargs)
 
-        if not os.path.exists(f"online_right_image.png"):
-            cv2.imwrite(f"online_right_image.png", obs["right"])
-            cv2.imwrite(f"online_head_image.png", obs["head"])
-            print("online_right_image shape:", obs["right"].shape)
-            print("online_head_image shape:", obs["head"].shape)
-            print('online_right_image has been saved!!!!!!!!!!!')
+        # 只保存 left / right / head，若 obs 中有则保存
+        img_src = obs.get("images", obs)
+        for key in ("left", "right", "head"):
+            if key in img_src and isinstance(img_src[key], np.ndarray):
+                path = f"online_{key}_image.png"
+                if not os.path.exists(path):
+                    cv2.imwrite(path, img_src[key])
+                    print(f"online_{key}_image shape: {img_src[key].shape}, saved.")
         reward_obs = copy.deepcopy(obs)
         reward_obs = make_policy_obs(reward_obs, self.device, self.robot_type)
         self.last_obs = reward_obs
