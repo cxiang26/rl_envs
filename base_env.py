@@ -647,7 +647,7 @@ class BaseEnv(gym.Env):
                 if hasattr(self.config, 'reset_hand_positions'):
                     hand_positions = self.config.reset_hand_positions
                     # self.robot_station.move_hand(hand_positions)
-                    self.robot_station.move_gripper([1.0, hand_positions[0]]) # 1.0 is the close gripper value
+                    self.robot_station.move_gripper([0.0, hand_positions[0]]) # 1.0 is the close gripper value
                     time.sleep(0.1)
                 
                 if hasattr(self.config, 'reset_head_positions') and hasattr(self.config, 'reset_waist_positions'):
@@ -861,7 +861,7 @@ class BaseEnv(gym.Env):
                         left_pose=None,
                         right_pose=right_pose
                     )
-                    self.robot_station.move_gripper([1.0, self.last_gripper_value])
+                    self.robot_station.move_gripper([0.0, self.last_gripper_value])
                 except Exception as e:
                     print(f"Warning: A2D robot_controller pose control failed: {e}, falling back to IK")
                     # use_robot_controller = False
@@ -934,32 +934,14 @@ class BaseEnv(gym.Env):
             np.ndarray: 当前末端位姿 [x, y, z, qx, qy, qz, qw]
         """
         frame_key = 'arm_left_link7' if arm == 'left' else 'arm_right_link7'
-        # 优先使用 robot_controller.get_motion_status()
-        if hasattr(self, 'robot_controller') and self.robot_controller is not None:
-            try:
-                current_states = self.robot_controller.get_motion_status()
-                ee_frame = current_states['frames'][frame_key]
-                pos, quat = ee_frame['position'], ee_frame['orientation']['quaternion']
-                return np.array([
-                    pos['x'], pos['y'], pos['z'],
-                    quat['x'], quat['y'], quat['z'], quat['w']
-                ])
-            except Exception as e:
-                print(f"Warning: Failed to get EE pose from robot_controller: {e}")
-        # 回退到正向运动学: left_pos, left_ori, right_pos, right_ori
-        if hasattr(self, 'robot_station') and hasattr(self, 'joint2ee') and self.joint2ee is not None:
-            try:
-                arm_joints, _ = self.robot_station.arm_joint_states()
-                waist_joints, _ = self.robot_station.waist_joint_states()
-                joint_positions = np.concatenate([arm_joints, waist_joints]).reshape(1, -1)
-                left_pos, left_ori, right_pos, right_ori = self.joint2ee.compute_forward_kinematics(joint_positions)
-                if arm == 'left':
-                    return np.concatenate([left_pos[0], left_ori[0]])
-                return np.concatenate([right_pos[0], right_ori[0]])
-            except Exception as e:
-                print(f"Warning: Failed to compute EE pose from FK: {e}")
-        # 最终回退（右手默认位姿）
-        return np.array([0.5, 0.0, 0.8, 0, 0, 0, 1])
+        current_states = self.robot_controller.get_motion_status()
+        ee_frame = current_states['frames'][frame_key]
+        pos, quat = ee_frame['position'], ee_frame['orientation']['quaternion']
+        return np.array([
+            pos['x'], pos['y'], pos['z'],
+            quat['x'], quat['y'], quat['z'], quat['w']
+        ])
+
 
     def _move_to_pose_with_interpolation(
         self, 
@@ -1099,7 +1081,13 @@ class BaseEnv(gym.Env):
 
         try:
             current_ee_pose = self._get_current_ee_pose(arm='left')
-
+            curren_right_ee_pose = self._get_current_ee_pose(arm='right')
+            right_pose = {
+                    'x': curren_right_ee_pose[0], 'y': curren_right_ee_pose[1], 'z': curren_right_ee_pose[2],
+                    'qx': curren_right_ee_pose[3], 'qy': curren_right_ee_pose[4], 'qz': curren_right_ee_pose[5], 'qw': curren_right_ee_pose[6]
+                }
+            # right_pose = {'x': 0.7367099590486855, 'y': -0.3049558173082615, 'z': 0.7104654299281462, 'qx': -0.5305025554176054, 'qy': 0.8351394817825288, 'qz': 0.07297996582241133, 'qw': 0.12563044715338886}
+                
             if len(target_pose) == 7:
                 if np.all(np.abs(target_pose[3:6]) <= 1.0):
                     goal_ee_pose = target_pose[:7].copy()
@@ -1123,7 +1111,6 @@ class BaseEnv(gym.Env):
             cnt = max(1, int(duration / (1 / self.hz)))
             pos_path = np.linspace(current_ee_pose[:3], goal_ee_pose[:3], cnt)
             euler_path = np.linspace(current_euler, goal_euler, cnt)
-
             for i in range(cnt):
                 pos = pos_path[i]
                 euler = euler_path[i]
@@ -1135,9 +1122,9 @@ class BaseEnv(gym.Env):
                 lifetime = max(1.0 / self.hz, 0.1)
                 self.robot_controller.set_end_effector_pose_control(
                     lifetime=lifetime,
-                    control_group=['left_arm'],
+                    control_group=['left_arm', 'right_arm'],
                     left_pose=left_pose,
-                    right_pose=None
+                    right_pose=right_pose
                 )
                 time.sleep(1 / self.hz)
 
