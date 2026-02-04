@@ -601,6 +601,21 @@ class BaseEnv(gym.Env):
         
         if "a2d" in self.robot_type.lower():
             try:
+                # 头部/腰部重置：仅当配置存在且 robot_station 支持该方法时调用；参数转为 list 以兼容 OmegaConf
+                if (
+                    hasattr(self.config, "reset_head_positions")
+                    and hasattr(self.config, "reset_waist_positions")
+                    and hasattr(self.robot_station, "move_head_and_waist")
+                ):
+                    head_pos = list(self.config.reset_head_positions)
+                    waist_pos = list(self.config.reset_waist_positions)
+                    # 若 SDK 要求腰部 lift 为 cm，与 set_initial 一致（此处按需取消注释）
+                    # waist_pos[1] = float(waist_pos[1]) * 100
+                    self.robot_station.move_head_and_waist(head_pos, waist_pos)
+                elif hasattr(self.config, "reset_head_positions") and hasattr(self.config, "reset_waist_positions"):
+                    print("Warning: robot_station has no move_head_and_waist, skip head/waist reset")
+                
+                time.sleep(0.5)
                 # 使用末端位置控制进行重置
                 use_ee_control = (
                     hasattr(self, 'robot_controller') and self.robot_controller is not None
@@ -648,15 +663,9 @@ class BaseEnv(gym.Env):
                     hand_positions = self.config.reset_hand_positions
                     # self.robot_station.move_hand(hand_positions)
                     self.robot_station.move_gripper([0.0, hand_positions[0]]) # 1.0 is the close gripper value
-                    time.sleep(0.1)
+                    time.sleep(0.5)
                 
-                if hasattr(self.config, 'reset_head_positions') and hasattr(self.config, 'reset_waist_positions'):
-                    self.robot_station.move_head_and_waist(
-                        self.config.reset_head_positions,
-                        self.config.reset_waist_positions
-                    )
-                
-                time.sleep(0.5)
+
                 
             except Exception as e:
                 print(f"Warning: A2D reset failed: {e}")
@@ -691,7 +700,8 @@ class BaseEnv(gym.Env):
             for p in path:
                 self._send_joint_command(p, include_gripper=False)
                 time.sleep(1 / self.hz)
-
+        # reset the gripper value to the close_gripper value
+        self.last_gripper_value = 1.0 if self.close_gripper else 0.0
         self._update_currpos()
         reset_pose = self.currpos.copy()
         reset_pose = self.pose_quat2euler(reset_pose)
