@@ -1223,26 +1223,19 @@ class BaseEnv(gym.Env):
         if "a2d" in self.robot_type.lower():
             obs = {}
             
-            try:
-                arm_joints, _ = self.robot_station.arm_joint_states()
-                waist_joints, _ = self.robot_station.waist_joint_states()
-                # hand_states, _ = self.robot_station.hand_joint_states()
-                gripper_states, _ = self.robot_station.gripper_states()
-                
-                # 使用统一的获取方法（问题6：消除代码重复）
-                arm_pose = self._get_current_ee_pose()
-                
-                obs['arm_joints'] = {'single': np.array(arm_joints[self.joint_dim:2*self.joint_dim])}
-                obs['arm_pose'] = {'single': arm_pose}
-                if len(gripper_states) > 6:
-                    obs['hand_joints'] = {'single': np.array(gripper_states[1:]) / 120}
-                else:
-                    obs['hand_joints'] = {'single': np.array([0.0])}
-                
-            except Exception as e:
-                print(f"Warning: A2D state retrieval failed: {e}")
-                obs['arm_joints'] = {'single': np.zeros(self.joint_dim)}
-                obs['arm_pose'] = {'single': np.array([0.5, 0.0, 0.8, 0, 0, 0, 1])}
+            arm_joints, _ = self.robot_station.arm_joint_states()
+            waist_joints, _ = self.robot_station.waist_joint_states()
+            # hand_states, _ = self.robot_station.hand_joint_states()
+            gripper_states, _ = self.robot_station.gripper_states()
+            
+            # 使用统一的获取方法（问题6：消除代码重复）
+            arm_pose = self._get_current_ee_pose()
+            
+            obs['arm_joints'] = {'single': np.array(arm_joints[self.joint_dim:2*self.joint_dim])}
+            obs['arm_pose'] = {'single': arm_pose}
+            if len(gripper_states) > 6:
+                obs['hand_joints'] = {'single': np.array(gripper_states[1:]) / 120}
+            else:
                 obs['hand_joints'] = {'single': np.array([0.0])}
             
             obs['images'] = {}
